@@ -1,4 +1,6 @@
-import setuptools
+﻿from setuptools import find_packages, setup
 
 if __name__ == "__main__":
-    setuptools.setup()
+    setup(
+        packages=find_packages(include=["nnunetv2", "nnunetv2.*"]),
+    )
