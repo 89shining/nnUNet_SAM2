@@ -149,7 +149,7 @@ class nnUNetTrainer(object):
         self.oversample_foreground_percent = 0.33
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
+        self.num_epochs = 200
         self.current_epoch = 0
         self.enable_deep_supervision = True
 
@@ -236,7 +236,7 @@ class nnUNetTrainer(object):
                                "That should not happen.")
 
     def _do_i_compile(self):
-        # new default: compile is enabled!
+        # default: compile is disabled unless explicitly enabled via nnUNet_compile
 
         # compile does not work on mps
         if self.device == torch.device('mps'):
@@ -259,7 +259,7 @@ class nnUNetTrainer(object):
             return False
 
         if 'nnUNet_compile' not in os.environ.keys():
-            return True
+            return False
         else:
             return os.environ['nnUNet_compile'].lower() in ('true', '1', 't')
 

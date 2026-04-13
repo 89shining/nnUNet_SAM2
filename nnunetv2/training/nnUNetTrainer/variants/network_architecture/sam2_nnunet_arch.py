@@ -170,7 +170,7 @@ class SAM2DualEncoderResidualUNet(nn.Module):
         self.fusion_scale = nn.Parameter(torch.tensor(1.0))
 
         self.sam_input_size = int(os.environ.get("NNUNET_SAM2_INPUT_SIZE", "1024"))
-        self.slice_batch = int(os.environ.get("NNUNET_SAM2_SLICE_BATCH", "32"))
+        self.slice_batch = int(os.environ.get("NNUNET_SAM2_SLICE_BATCH", "4"))
 
     def _sam_encode_in_chunks(self, x_2d: torch.Tensor) -> torch.Tensor:
         feats = []
