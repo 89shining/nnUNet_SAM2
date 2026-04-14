@@ -166,11 +166,19 @@ class SAM2DualEncoderResidualUNet(nn.Module):
         self.sam_encoder.blocks = nn.Sequential(*[Adapter(b) for b in self.sam_encoder.blocks])
 
         deepest_channels = self.encoder.output_channels[-1]
-        self.sam_fuse_proj = nn.Conv2d(1152, deepest_channels, kernel_size=1, bias=False)
+        sam_out_channels = self._infer_sam_out_channels()
+        self.sam_fuse_proj = nn.Conv2d(sam_out_channels, deepest_channels, kernel_size=1, bias=False)
         self.fusion_scale = nn.Parameter(torch.tensor(1.0))
 
         self.sam_input_size = int(os.environ.get("NNUNET_SAM2_INPUT_SIZE", "1024"))
         self.slice_batch = int(os.environ.get("NNUNET_SAM2_SLICE_BATCH", "4"))
+
+    def _infer_sam_out_channels(self) -> int:
+        # Keep fusion compatible across SAM2 tiny/small/base+/large variants.
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, 64, 64, dtype=torch.float32)
+            _, _, _, f = self.sam_encoder(dummy)
+        return int(f.shape[1])
 
     def _sam_encode_in_chunks(self, x_2d: torch.Tensor) -> torch.Tensor:
         feats = []
