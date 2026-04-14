@@ -1,15 +1,17 @@
 ﻿import os
 import sys
+import warnings
 from pathlib import Path
 from typing import List, Tuple, Type, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dynamic_network_architectures.building_blocks.helper import convert_conv_op_to_dim
+from dynamic_network_architectures.building_blocks.helper import convert_conv_op_to_dim, get_matching_convtransp
 from dynamic_network_architectures.building_blocks.residual import BasicBlockD, BottleneckD
 from dynamic_network_architectures.building_blocks.residual_encoders import ResidualEncoder
-from dynamic_network_architectures.building_blocks.unet_decoder import UNetDecoder
+from dynamic_network_architectures.building_blocks.simple_conv_blocks import StackedConvBlocks
 from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.dropout import _DropoutNd
 
@@ -64,11 +66,115 @@ class Adapter(nn.Module):
         return self.block(x + prompt)
 
 
+class SAM2FusionDecoder(nn.Module):
+    """
+    nnSAM-style decoder: one selected decoder stage receives additional SAM feature channels
+    via concatenated skip features.
+    """
+
+    def __init__(
+        self,
+        encoder: ResidualEncoder,
+        num_classes: int,
+        n_conv_per_stage: Union[int, Tuple[int, ...], List[int]],
+        deep_supervision: bool,
+        fusion_stage_index: int,
+        fusion_channels: int,
+    ):
+        super().__init__()
+        self.deep_supervision = deep_supervision
+        self.encoder = encoder
+        self.num_classes = num_classes
+        self.fusion_stage_index = fusion_stage_index
+        self.fusion_channels = fusion_channels
+
+        n_stages_encoder = len(encoder.output_channels)
+        if isinstance(n_conv_per_stage, int):
+            n_conv_per_stage = [n_conv_per_stage] * (n_stages_encoder - 1)
+        assert len(n_conv_per_stage) == n_stages_encoder - 1, (
+            "n_conv_per_stage must have one entry per decoder stage."
+        )
+
+        transpconv_op = get_matching_convtransp(conv_op=encoder.conv_op)
+
+        stages = []
+        transpconvs = []
+        seg_layers = []
+        for s in range(1, n_stages_encoder):
+            input_features_below = encoder.output_channels[-s]
+            input_features_skip = encoder.output_channels[-(s + 1)]
+            stride_for_transpconv = encoder.strides[-s]
+            transpconvs.append(
+                transpconv_op(
+                    input_features_below,
+                    input_features_skip,
+                    stride_for_transpconv,
+                    stride_for_transpconv,
+                    bias=encoder.conv_bias,
+                )
+            )
+
+            stage_idx = s - 1
+            extra_channels = self.fusion_channels if stage_idx == self.fusion_stage_index else 0
+            stages.append(
+                StackedConvBlocks(
+                    n_conv_per_stage[stage_idx],
+                    encoder.conv_op,
+                    (2 * input_features_skip) + extra_channels,
+                    input_features_skip,
+                    encoder.kernel_sizes[-(s + 1)],
+                    1,
+                    encoder.conv_bias,
+                    encoder.norm_op,
+                    encoder.norm_op_kwargs,
+                    encoder.dropout_op,
+                    encoder.dropout_op_kwargs,
+                    encoder.nonlin,
+                    encoder.nonlin_kwargs,
+                )
+            )
+
+            seg_layers.append(encoder.conv_op(input_features_skip, num_classes, 1, 1, 0, bias=True))
+
+        self.stages = nn.ModuleList(stages)
+        self.transpconvs = nn.ModuleList(transpconvs)
+        self.seg_layers = nn.ModuleList(seg_layers)
+
+    def forward(self, skips):
+        lres_input = skips[-1]
+        seg_outputs = []
+        for s in range(len(self.stages)):
+            x = self.transpconvs[s](lres_input)
+            x = torch.cat((x, skips[-(s + 2)]), 1)
+            x = self.stages[s](x)
+            if self.deep_supervision:
+                seg_outputs.append(self.seg_layers[s](x))
+            elif s == (len(self.stages) - 1):
+                seg_outputs.append(self.seg_layers[-1](x))
+            lres_input = x
+
+        seg_outputs = seg_outputs[::-1]
+        return seg_outputs if self.deep_supervision else seg_outputs[0]
+
+    def compute_conv_feature_map_size(self, input_size):
+        skip_sizes = []
+        for s in range(len(self.encoder.strides) - 1):
+            skip_sizes.append([i // j for i, j in zip(input_size, self.encoder.strides[s])])
+            input_size = skip_sizes[-1]
+
+        output = np.int64(0)
+        for s in range(len(self.stages)):
+            output += self.stages[s].compute_conv_feature_map_size(skip_sizes[-(s + 1)])
+            output += np.prod([self.encoder.output_channels[-(s + 2)], *skip_sizes[-(s + 1)]], dtype=np.int64)
+            if self.deep_supervision or (s == (len(self.stages) - 1)):
+                output += np.prod([self.num_classes, *skip_sizes[-(s + 1)]], dtype=np.int64)
+        return output
+
+
 class SAM2DualEncoderResidualUNet(nn.Module):
     """
-    nnUNet native ResidualEncoder + UNetDecoder with an auxiliary SAM2 encoder branch.
-    2D input: standard deep fusion.
-    3D input: slice-wise SAM2 encoding then reshaped fusion.
+    nnUNet native ResidualEncoder + decoder with an auxiliary SAM2 encoder branch.
+    Uses nnSAM-style concatenation fusion at a selected deep skip stage.
     """
 
     def __init__(
@@ -130,7 +236,26 @@ class SAM2DualEncoderResidualUNet(nn.Module):
             disable_default_stem=False,
             stem_channels=stem_channels,
         )
-        self.decoder = UNetDecoder(self.encoder, num_classes, n_conv_per_stage_decoder, deep_supervision)
+
+        self.fusion_skip_index = int(os.environ.get("NNUNET_SAM2_FUSION_SKIP_INDEX", "3"))
+        max_skip_index = len(self.encoder.output_channels) - 2
+        if max_skip_index < 0:
+            raise RuntimeError("Invalid encoder output stages for SAM2 fusion.")
+        self.fusion_skip_index = max(0, min(self.fusion_skip_index, max_skip_index))
+
+        self.sam_fusion_channels = int(os.environ.get("NNUNET_SAM2_FUSION_CHANNELS", "256"))
+        if self.sam_fusion_channels <= 0:
+            raise ValueError(f"NNUNET_SAM2_FUSION_CHANNELS must be > 0, got {self.sam_fusion_channels}")
+
+        self.fusion_stage_index = (len(self.encoder.output_channels) - 2) - self.fusion_skip_index
+        self.decoder = SAM2FusionDecoder(
+            self.encoder,
+            num_classes,
+            n_conv_per_stage_decoder,
+            deep_supervision,
+            fusion_stage_index=self.fusion_stage_index,
+            fusion_channels=self.sam_fusion_channels,
+        )
 
         self.net_dim = convert_conv_op_to_dim(conv_op)
         if self.net_dim not in (2, 3):
@@ -165,16 +290,19 @@ class SAM2DualEncoderResidualUNet(nn.Module):
             p.requires_grad = False
         self.sam_encoder.blocks = nn.Sequential(*[Adapter(b) for b in self.sam_encoder.blocks])
 
-        deepest_channels = self.encoder.output_channels[-1]
         sam_out_channels = self._infer_sam_out_channels()
-        self.sam_fuse_proj = nn.Conv2d(sam_out_channels, deepest_channels, kernel_size=1, bias=False)
+        self.sam_fuse_proj = nn.Conv2d(sam_out_channels, self.sam_fusion_channels, kernel_size=1, bias=False)
         self.fusion_scale = nn.Parameter(torch.tensor(1.0))
 
         self.sam_input_size = int(os.environ.get("NNUNET_SAM2_INPUT_SIZE", "1024"))
+        if self.sam_input_size <= 0:
+            raise ValueError(f"NNUNET_SAM2_INPUT_SIZE must be > 0, got {self.sam_input_size}")
+
         self.slice_batch = int(os.environ.get("NNUNET_SAM2_SLICE_BATCH", "4"))
+        if self.slice_batch <= 0:
+            raise ValueError(f"NNUNET_SAM2_SLICE_BATCH must be > 0, got {self.slice_batch}")
 
     def _infer_sam_out_channels(self) -> int:
-        # Keep fusion compatible across SAM2 tiny/small/base+/large variants.
         with torch.no_grad():
             dummy = torch.zeros(1, 3, 64, 64, dtype=torch.float32)
             _, _, _, f = self.sam_encoder(dummy)
@@ -184,7 +312,7 @@ class SAM2DualEncoderResidualUNet(nn.Module):
         feats = []
         bs = x_2d.shape[0]
         for i in range(0, bs, self.slice_batch):
-            part = x_2d[i : i + self.slice_batch]
+            part = x_2d[i: i + self.slice_batch]
             _, _, _, f = self.sam_encoder(part)
             feats.append(f)
         return torch.cat(feats, dim=0)
@@ -214,13 +342,18 @@ class SAM2DualEncoderResidualUNet(nn.Module):
 
     def forward(self, x: torch.Tensor):
         skips = list(self.encoder(x))
+        target_spatial_shape = skips[self.fusion_skip_index].shape[2:]
 
         if self.net_dim == 2:
-            sam_feat = self._build_sam_feat_2d(x, target_hw=skips[-1].shape[2:])
-            skips[-1] = skips[-1] + self.fusion_scale * sam_feat
+            sam_feat = self._build_sam_feat_2d(x, target_hw=target_spatial_shape)
+            skips[self.fusion_skip_index] = torch.cat(
+                (skips[self.fusion_skip_index], self.fusion_scale * sam_feat), dim=1
+            )
         else:
-            sam_feat = self._build_sam_feat_3d(x, target_dhw=skips[-1].shape[2:])
-            skips[-1] = skips[-1] + self.fusion_scale * sam_feat
+            sam_feat = self._build_sam_feat_3d(x, target_dhw=target_spatial_shape)
+            skips[self.fusion_skip_index] = torch.cat(
+                (skips[self.fusion_skip_index], self.fusion_scale * sam_feat), dim=1
+            )
 
         return self.decoder(skips)
 
@@ -234,7 +367,19 @@ class SAM2DualEncoderResidualUNet(nn.Module):
 
 
 def get_sam2_checkpoint_from_env() -> str:
-    return os.environ.get("NNUNET_SAM2_CHECKPOINT", None)
+    ckpt_path = os.environ.get("NNUNET_SAM2_CHECKPOINT", None)
+    if ckpt_path is None:
+        warnings.warn(
+            "NNUNET_SAM2_CHECKPOINT is not set. SAM2 trunk may start without pretrained weights, "
+            "which is usually not intended for training.",
+            UserWarning,
+        )
+        return None
+
+    if not Path(ckpt_path).is_file():
+        raise FileNotFoundError(f"NNUNET_SAM2_CHECKPOINT points to a non-existing file: {ckpt_path}")
+
+    return ckpt_path
 
 
 def _normalize_sam2_cfg_name(cfg_name: str) -> str:

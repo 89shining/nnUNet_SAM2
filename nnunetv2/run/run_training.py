@@ -48,7 +48,7 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
                                                     'nnUNetTrainer'
 
     # handle dataset input. If it's an ID we need to convert to int from string
-    if dataset_name_or_id.startswith('Dataset'):
+    if isinstance(dataset_name_or_id, str) and dataset_name_or_id.startswith('Dataset'):
         pass
     else:
         try:
