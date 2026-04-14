@@ -1,5 +1,6 @@
 ﻿import os
 import sys
+import warnings
 from pathlib import Path
 from typing import List, Tuple, Type, Union
 
@@ -171,7 +172,12 @@ class SAM2DualEncoderResidualUNet(nn.Module):
         self.fusion_scale = nn.Parameter(torch.tensor(1.0))
 
         self.sam_input_size = int(os.environ.get("NNUNET_SAM2_INPUT_SIZE", "1024"))
+        if self.sam_input_size <= 0:
+            raise ValueError(f"NNUNET_SAM2_INPUT_SIZE must be > 0, got {self.sam_input_size}")
+
         self.slice_batch = int(os.environ.get("NNUNET_SAM2_SLICE_BATCH", "4"))
+        if self.slice_batch <= 0:
+            raise ValueError(f"NNUNET_SAM2_SLICE_BATCH must be > 0, got {self.slice_batch}")
 
     def _infer_sam_out_channels(self) -> int:
         # Keep fusion compatible across SAM2 tiny/small/base+/large variants.
@@ -234,7 +240,19 @@ class SAM2DualEncoderResidualUNet(nn.Module):
 
 
 def get_sam2_checkpoint_from_env() -> str:
-    return os.environ.get("NNUNET_SAM2_CHECKPOINT", None)
+    ckpt_path = os.environ.get("NNUNET_SAM2_CHECKPOINT", None)
+    if ckpt_path is None:
+        warnings.warn(
+            "NNUNET_SAM2_CHECKPOINT is not set. SAM2 trunk may start without pretrained weights, "
+            "which is usually not intended for training.",
+            UserWarning,
+        )
+        return None
+
+    if not Path(ckpt_path).is_file():
+        raise FileNotFoundError(f"NNUNET_SAM2_CHECKPOINT points to a non-existing file: {ckpt_path}")
+
+    return ckpt_path
 
 
 def _normalize_sam2_cfg_name(cfg_name: str) -> str:
