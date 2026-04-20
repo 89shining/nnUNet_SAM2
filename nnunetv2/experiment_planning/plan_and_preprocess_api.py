@@ -1,7 +1,8 @@
 import warnings
+import os
 from typing import List, Type, Optional, Tuple, Union
 
-from batchgenerators.utilities.file_and_folder_operations import join, maybe_mkdir_p, load_json
+from batchgenerators.utilities.file_and_folder_operations import join, maybe_mkdir_p, load_json, save_json, isfile
 
 import nnunetv2
 from nnunetv2.configuration import default_num_processes
@@ -12,7 +13,62 @@ from nnunetv2.paths import nnUNet_raw, nnUNet_preprocessed
 from nnunetv2.utilities.dataset_name_id_conversion import convert_id_to_dataset_name
 from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
+from nnunetv2.utilities.crossval_split import generate_crossval_split
 from nnunetv2.utilities.utils import get_filenames_of_train_images_and_targets
+from nnunetv2.training.dataloading.utils import get_case_identifiers
+
+
+def _maybe_create_default_splits(dataset_name: str, plans_manager: PlansManager,
+                                 preferred_configurations: Union[Tuple[str], List[str]]) -> None:
+    """
+    Create splits_final.json once preprocessing is done so users don't need a manual script before training.
+    """
+    splits_file = join(nnUNet_preprocessed, dataset_name, "splits_final.json")
+    if isfile(splits_file):
+        print(f"Using existing split file: {splits_file}")
+        return
+
+    candidate_configs = list(dict.fromkeys(list(preferred_configurations) + list(plans_manager.available_configurations)))
+    case_identifiers = None
+
+    for c in candidate_configs:
+        if c not in plans_manager.available_configurations:
+            continue
+        cfg = plans_manager.get_configuration(c)
+        data_folder = join(nnUNet_preprocessed, dataset_name, cfg.data_identifier)
+        if not os.path.isdir(data_folder):
+            continue
+        ids = sorted(get_case_identifiers(data_folder))
+        if len(ids) > 0:
+            case_identifiers = ids
+            print(f"Auto-generating splits from configuration '{c}' in {data_folder}")
+            break
+
+    if case_identifiers is None:
+        warnings.warn(
+            f"Could not auto-create splits_final.json for {dataset_name}: no preprocessed cases found.",
+            UserWarning
+        )
+        return
+
+    if len(case_identifiers) < 2:
+        warnings.warn(
+            f"Could not auto-create splits_final.json for {dataset_name}: need at least 2 cases, got "
+            f"{len(case_identifiers)}.",
+            UserWarning
+        )
+        return
+
+    n_splits = 5 if len(case_identifiers) >= 5 else len(case_identifiers)
+    if n_splits < 5:
+        warnings.warn(
+            f"{dataset_name} has only {len(case_identifiers)} cases. Creating {n_splits}-fold split instead of 5-fold.",
+            UserWarning
+        )
+
+    splits = generate_crossval_split(case_identifiers, seed=12345, n_splits=n_splits)
+    save_json(splits, splits_file, sort_keys=False)
+    print(f"Created split file: {splits_file} ({len(splits)} folds)")
 
 
 def extract_fingerprint_dataset(dataset_id: int,
@@ -139,6 +195,8 @@ def preprocess_dataset(dataset_id: int,
         copy_file(dataset[k]['label'],
                   join(nnUNet_preprocessed, dataset_name, 'gt_segmentations', k + dataset_json['file_ending']),
                   update=True)
+
+    _maybe_create_default_splits(dataset_name, plans_manager, configurations)
 
 
 def preprocess(dataset_ids: List[int],

@@ -1,4 +1,5 @@
-﻿import os
+import math
+import os
 import sys
 import warnings
 from pathlib import Path
@@ -68,8 +69,7 @@ class Adapter(nn.Module):
 
 class SAM2FusionDecoder(nn.Module):
     """
-    nnSAM-style decoder: one selected decoder stage receives additional SAM feature channels
-    via concatenated skip features.
+    Default nnUNet-style decoder that expects unchanged skip channel sizes.
     """
 
     def __init__(
@@ -78,15 +78,11 @@ class SAM2FusionDecoder(nn.Module):
         num_classes: int,
         n_conv_per_stage: Union[int, Tuple[int, ...], List[int]],
         deep_supervision: bool,
-        fusion_stage_index: int,
-        fusion_channels: int,
     ):
         super().__init__()
         self.deep_supervision = deep_supervision
         self.encoder = encoder
         self.num_classes = num_classes
-        self.fusion_stage_index = fusion_stage_index
-        self.fusion_channels = fusion_channels
 
         n_stages_encoder = len(encoder.output_channels)
         if isinstance(n_conv_per_stage, int):
@@ -114,13 +110,11 @@ class SAM2FusionDecoder(nn.Module):
                 )
             )
 
-            stage_idx = s - 1
-            extra_channels = self.fusion_channels if stage_idx == self.fusion_stage_index else 0
             stages.append(
                 StackedConvBlocks(
-                    n_conv_per_stage[stage_idx],
+                    n_conv_per_stage[s - 1],
                     encoder.conv_op,
-                    (2 * input_features_skip) + extra_channels,
+                    2 * input_features_skip,
                     input_features_skip,
                     encoder.kernel_sizes[-(s + 1)],
                     1,
@@ -174,7 +168,7 @@ class SAM2FusionDecoder(nn.Module):
 class SAM2DualEncoderResidualUNet(nn.Module):
     """
     nnUNet native ResidualEncoder + decoder with an auxiliary SAM2 encoder branch.
-    Uses nnSAM-style concatenation fusion at a selected deep skip stage.
+    Uses per-skip nearest-scale SAM2 fusion with gated residual addition.
     """
 
     def __init__(
@@ -237,24 +231,11 @@ class SAM2DualEncoderResidualUNet(nn.Module):
             stem_channels=stem_channels,
         )
 
-        self.fusion_skip_index = int(os.environ.get("NNUNET_SAM2_FUSION_SKIP_INDEX", "3"))
-        max_skip_index = len(self.encoder.output_channels) - 2
-        if max_skip_index < 0:
-            raise RuntimeError("Invalid encoder output stages for SAM2 fusion.")
-        self.fusion_skip_index = max(0, min(self.fusion_skip_index, max_skip_index))
-
-        self.sam_fusion_channels = int(os.environ.get("NNUNET_SAM2_FUSION_CHANNELS", "256"))
-        if self.sam_fusion_channels <= 0:
-            raise ValueError(f"NNUNET_SAM2_FUSION_CHANNELS must be > 0, got {self.sam_fusion_channels}")
-
-        self.fusion_stage_index = (len(self.encoder.output_channels) - 2) - self.fusion_skip_index
         self.decoder = SAM2FusionDecoder(
             self.encoder,
             num_classes,
             n_conv_per_stage_decoder,
             deep_supervision,
-            fusion_stage_index=self.fusion_stage_index,
-            fusion_channels=self.sam_fusion_channels,
         )
 
         self.net_dim = convert_conv_op_to_dim(conv_op)
@@ -290,10 +271,6 @@ class SAM2DualEncoderResidualUNet(nn.Module):
             p.requires_grad = False
         self.sam_encoder.blocks = nn.Sequential(*[Adapter(b) for b in self.sam_encoder.blocks])
 
-        sam_out_channels = self._infer_sam_out_channels()
-        self.sam_fuse_proj = nn.Conv2d(sam_out_channels, self.sam_fusion_channels, kernel_size=1, bias=False)
-        self.fusion_scale = nn.Parameter(torch.tensor(1.0))
-
         self.sam_input_size = int(os.environ.get("NNUNET_SAM2_INPUT_SIZE", "1024"))
         if self.sam_input_size <= 0:
             raise ValueError(f"NNUNET_SAM2_INPUT_SIZE must be > 0, got {self.sam_input_size}")
@@ -302,22 +279,72 @@ class SAM2DualEncoderResidualUNet(nn.Module):
         if self.slice_batch <= 0:
             raise ValueError(f"NNUNET_SAM2_SLICE_BATCH must be > 0, got {self.slice_batch}")
 
-    def _infer_sam_out_channels(self) -> int:
+        self.fuse_mode = os.environ.get("NNUNET_SAM2_FUSE_MODE", "gated_add").lower()
+        if self.fuse_mode not in ("gated_add", "add"):
+            raise ValueError(
+                f"NNUNET_SAM2_FUSE_MODE must be one of ['gated_add', 'add'], got {self.fuse_mode}"
+            )
+
+        self.sam_out_channels = self._infer_sam_out_channels()
+        conv_cls = nn.Conv2d if self.net_dim == 2 else nn.Conv3d
+        self.sam_common_channels = int(
+            os.environ.get("NNUNET_SAM2_COMMON_CHANNELS", os.environ.get("NNUNET_SAM2_FUSION_CHANNELS", "256"))
+        )
+        if self.sam_common_channels <= 0:
+            raise ValueError(f"NNUNET_SAM2_COMMON_CHANNELS must be > 0, got {self.sam_common_channels}")
+
+        # O(M): one unify layer per SAM feature level.
+        self.sam_unify = nn.ModuleList(
+            [conv_cls(s_ch, self.sam_common_channels, kernel_size=1, bias=False) for s_ch in self.sam_out_channels]
+        )
+        # O(N): one projection/gate/scale per nnUNet skip level.
+        self.fuse_proj = nn.ModuleList(
+            [
+                conv_cls(self.sam_common_channels, x_ch, kernel_size=1, bias=False)
+                for x_ch in self.encoder.output_channels
+            ]
+        )
+        self.fuse_gate = (
+            nn.ModuleList(
+                [conv_cls(2 * x_ch, x_ch, kernel_size=1, bias=True) for x_ch in self.encoder.output_channels]
+            )
+            if self.fuse_mode == "gated_add"
+            else None
+        )
+        self.fuse_scale = nn.ParameterList(
+            [nn.Parameter(torch.tensor(0.0)) for _ in self.encoder.output_channels]
+        )
+
+    @staticmethod
+    def _normalize_sam_outputs(sam_outputs) -> List[torch.Tensor]:
+        if isinstance(sam_outputs, (list, tuple)):
+            feats = [i for i in sam_outputs if torch.is_tensor(i)]
+            if len(feats) == 0:
+                raise RuntimeError("SAM2 trunk returned no tensor features.")
+            return feats
+        raise RuntimeError(f"Unsupported SAM2 trunk output type: {type(sam_outputs)}")
+
+    def _infer_sam_out_channels(self) -> List[int]:
         with torch.no_grad():
             dummy = torch.zeros(1, 3, 64, 64, dtype=torch.float32)
-            _, _, _, f = self.sam_encoder(dummy)
-        return int(f.shape[1])
+            feats = self._normalize_sam_outputs(self.sam_encoder(dummy))
+        return [int(i.shape[1]) for i in feats]
 
-    def _sam_encode_in_chunks(self, x_2d: torch.Tensor) -> torch.Tensor:
-        feats = []
+    def _sam_encode_in_chunks(self, x_2d: torch.Tensor) -> List[torch.Tensor]:
+        feats = None
         bs = x_2d.shape[0]
         for i in range(0, bs, self.slice_batch):
             part = x_2d[i: i + self.slice_batch]
-            _, _, _, f = self.sam_encoder(part)
-            feats.append(f)
-        return torch.cat(feats, dim=0)
+            part_feats = self._normalize_sam_outputs(self.sam_encoder(part))
+            if feats is None:
+                feats = [[] for _ in range(len(part_feats))]
+            if len(part_feats) != len(feats):
+                raise RuntimeError("Inconsistent number of SAM2 feature levels across chunks.")
+            for j, f in enumerate(part_feats):
+                feats[j].append(f)
+        return [torch.cat(i, dim=0) for i in feats]
 
-    def _build_sam_feat_2d(self, x: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
+    def _build_sam_feats_2d(self, x: torch.Tensor) -> List[torch.Tensor]:
         sam_x = self.sam_input_adapter(x)
         sam_x = F.interpolate(
             sam_x,
@@ -325,37 +352,59 @@ class SAM2DualEncoderResidualUNet(nn.Module):
             mode="bilinear",
             align_corners=True,
         )
-        sam_feat = self._sam_encode_in_chunks(sam_x)
-        sam_feat = self.sam_fuse_proj(sam_feat)
-        sam_feat = F.interpolate(sam_feat, size=target_hw, mode="bilinear", align_corners=False)
-        return sam_feat
+        return self._sam_encode_in_chunks(sam_x)
 
-    def _build_sam_feat_3d(self, x: torch.Tensor, target_dhw: Tuple[int, int, int]) -> torch.Tensor:
+    def _build_sam_feats_3d(self, x: torch.Tensor) -> List[torch.Tensor]:
         b, c, d, h, w = x.shape
         slices = x.permute(0, 2, 1, 3, 4).reshape(b * d, c, h, w)
-        sam_feat_2d = self._build_sam_feat_2d(slices, target_hw=(target_dhw[1], target_dhw[2]))
-        c_out = sam_feat_2d.shape[1]
-        sam_feat_3d = sam_feat_2d.reshape(b, d, c_out, target_dhw[1], target_dhw[2]).permute(0, 2, 1, 3, 4)
-        if sam_feat_3d.shape[2] != target_dhw[0]:
-            sam_feat_3d = F.interpolate(sam_feat_3d, size=target_dhw, mode="trilinear", align_corners=False)
-        return sam_feat_3d
+        sam_feats_2d = self._build_sam_feats_2d(slices)
+        sam_feats_3d = []
+        for feat_2d in sam_feats_2d:
+            c_out = feat_2d.shape[1]
+            sam_feats_3d.append(feat_2d.reshape(b, d, c_out, feat_2d.shape[-2], feat_2d.shape[-1]).permute(0, 2, 1, 3, 4))
+        return sam_feats_3d
+
+    @staticmethod
+    def _nearest_scale_idx(skip_spatial, sam_spatials) -> int:
+        def _norm_dims(shape):
+            if len(shape) == 3:
+                return shape[1], shape[2]
+            return tuple(shape)
+
+        skip_dims = _norm_dims(skip_spatial)
+        scores = []
+        for j, shape in enumerate(sam_spatials):
+            sam_dims = _norm_dims(shape)
+            score = 0.0
+            for a, b in zip(skip_dims, sam_dims):
+                score += abs(math.log2(max(a, 1)) - math.log2(max(b, 1)))
+            scores.append((score, j))
+        return min(scores)[1]
+
+    def _resize_to_skip(self, feat: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        if feat.shape[2:] == skip.shape[2:]:
+            return feat
+        mode = "bilinear" if self.net_dim == 2 else "trilinear"
+        return F.interpolate(feat, size=skip.shape[2:], mode=mode, align_corners=False)
 
     def forward(self, x: torch.Tensor):
         skips = list(self.encoder(x))
-        target_spatial_shape = skips[self.fusion_skip_index].shape[2:]
+        sam_feats = self._build_sam_feats_2d(x) if self.net_dim == 2 else self._build_sam_feats_3d(x)
+        sam_spatials = [i.shape[2:] for i in sam_feats]
 
-        if self.net_dim == 2:
-            sam_feat = self._build_sam_feat_2d(x, target_hw=target_spatial_shape)
-            skips[self.fusion_skip_index] = torch.cat(
-                (skips[self.fusion_skip_index], self.fusion_scale * sam_feat), dim=1
-            )
-        else:
-            sam_feat = self._build_sam_feat_3d(x, target_dhw=target_spatial_shape)
-            skips[self.fusion_skip_index] = torch.cat(
-                (skips[self.fusion_skip_index], self.fusion_scale * sam_feat), dim=1
-            )
+        fused_skips = []
+        for i, skip in enumerate(skips):
+            j = self._nearest_scale_idx(skip.shape[2:], sam_spatials)
+            sam_feat = self.sam_unify[j](sam_feats[j])
+            sam_feat = self._resize_to_skip(sam_feat, skip)
+            sam_proj = self.fuse_proj[i](sam_feat)
+            if self.fuse_mode == "gated_add":
+                gate = torch.sigmoid(self.fuse_gate[i](torch.cat((skip, sam_proj), dim=1)))
+                fused_skips.append(skip + self.fuse_scale[i] * gate * sam_proj)
+            else:
+                fused_skips.append(skip + self.fuse_scale[i] * sam_proj)
 
-        return self.decoder(skips)
+        return self.decoder(fused_skips)
 
     def compute_conv_feature_map_size(self, input_size):
         assert len(input_size) == convert_conv_op_to_dim(self.encoder.conv_op), (
