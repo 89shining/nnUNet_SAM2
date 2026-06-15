@@ -50,6 +50,13 @@ _add_sam2_unet_repo_to_path()
 from sam2.build_sam import build_sam2  # noqa: E402
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, None)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 class Adapter(nn.Module):
     def __init__(self, blk: nn.Module) -> None:
         super().__init__()
@@ -65,6 +72,33 @@ class Adapter(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         prompt = self.prompt_learn(x)
         return self.block(x + prompt)
+
+
+class CorrectionMaskEncoder(nn.Module):
+    """
+    Lightweight dense prompt encoder for positive/negative correction masks.
+    Positive and negative correction masks carry add/delete semantics and are
+    intentionally kept separate from SAM2's original mask prompt.
+    """
+
+    def __init__(self, prompt_embed_dim: int, hidden_dim: int = 64) -> None:
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(2, hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(1, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(1, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, prompt_embed_dim, kernel_size=1),
+        )
+
+    def forward(self, corr_masks: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
+        if corr_masks.shape[2:] != target_hw:
+            corr_masks = F.interpolate(corr_masks.float(), size=target_hw, mode="bilinear", align_corners=False)
+        dense_corr = self.encoder(corr_masks.float())
+        has_corr = (corr_masks.abs().flatten(1).sum(dim=1) > 0).to(dtype=dense_corr.dtype)
+        return dense_corr * has_corr.view(-1, 1, 1, 1)
 
 
 class SAM2FusionDecoder(nn.Module):
@@ -209,8 +243,9 @@ class SAM2DualEncoderResidualUNet(nn.Module):
         if isinstance(n_conv_per_stage_decoder, int):
             n_conv_per_stage_decoder = [n_conv_per_stage_decoder] * (n_stages - 1)
 
+        self.main_input_channels = max(2, int(input_channels))
         self.encoder = ResidualEncoder(
-            input_channels,
+            self.main_input_channels,
             n_stages,
             features_per_stage,
             conv_op,
@@ -242,9 +277,7 @@ class SAM2DualEncoderResidualUNet(nn.Module):
         if self.net_dim not in (2, 3):
             raise RuntimeError(f"Unsupported conv dim {self.net_dim}. Only 2D/3D are supported.")
 
-        self.sam_input_adapter = (
-            nn.Identity() if input_channels == 3 else nn.Conv2d(input_channels, 3, kernel_size=1, bias=False)
-        )
+        self.sam_input_adapter = nn.Conv2d(1, 3, kernel_size=1, bias=False)
 
         sam_model = build_sam2(
             sam2_model_cfg,
@@ -252,24 +285,23 @@ class SAM2DualEncoderResidualUNet(nn.Module):
             device="cpu",
             mode="eval",
         )
-        for attr in (
-            "sam_mask_decoder",
-            "sam_prompt_encoder",
-            "memory_encoder",
-            "memory_attention",
-            "mask_downsample",
-            "obj_ptr_tpos_proj",
-            "obj_ptr_proj",
-        ):
+        for attr in ("memory_encoder", "memory_attention", "mask_downsample", "obj_ptr_tpos_proj", "obj_ptr_proj"):
             if hasattr(sam_model, attr):
                 delattr(sam_model, attr)
-        if hasattr(sam_model, "image_encoder") and hasattr(sam_model.image_encoder, "neck"):
-            del sam_model.image_encoder.neck
 
-        self.sam_encoder = sam_model.image_encoder.trunk
-        for p in self.sam_encoder.parameters():
+        self.sam_image_encoder = sam_model.image_encoder
+        self.sam_encoder = self.sam_image_encoder.trunk
+        self.sam_prompt_encoder = sam_model.sam_prompt_encoder
+        self.sam_mask_decoder = sam_model.sam_mask_decoder
+        self.use_high_res_features_in_sam = bool(getattr(sam_model, "use_high_res_features_in_sam", False))
+
+        for p in self.sam_image_encoder.parameters():
             p.requires_grad = False
         self.sam_encoder.blocks = nn.Sequential(*[Adapter(b) for b in self.sam_encoder.blocks])
+        for p in self.sam_prompt_encoder.parameters():
+            p.requires_grad = False
+        for p in self.sam_mask_decoder.parameters():
+            p.requires_grad = False
 
         self.sam_input_size = int(os.environ.get("NNUNET_SAM2_INPUT_SIZE", "1024"))
         if self.sam_input_size <= 0:
@@ -278,6 +310,10 @@ class SAM2DualEncoderResidualUNet(nn.Module):
         self.slice_batch = int(os.environ.get("NNUNET_SAM2_SLICE_BATCH", "4"))
         if self.slice_batch <= 0:
             raise ValueError(f"NNUNET_SAM2_SLICE_BATCH must be > 0, got {self.slice_batch}")
+
+        self.prompt_threshold = float(os.environ.get("NNUNET_SAM2_PROMPT_THRESHOLD", "0.5"))
+        self.debug_shapes = _env_flag("NNUNET_SAM2_DEBUG_SHAPES", False)
+        self.use_initial_mask_as_sam_prompt = _env_flag("NNUNET_SAM2_USE_INITIAL_MASK_AS_SAM_PROMPT", False)
 
         self.fuse_mode = os.environ.get("NNUNET_SAM2_FUSE_MODE", "gated_add").lower()
         if self.fuse_mode not in ("gated_add", "add"):
@@ -314,6 +350,61 @@ class SAM2DualEncoderResidualUNet(nn.Module):
         self.fuse_scale = nn.ParameterList(
             [nn.Parameter(torch.tensor(0.0)) for _ in self.encoder.output_channels]
         )
+        self.prompt_refine_levels = int(os.environ.get("NNUNET_SAM2_PROMPT_REFINE_LEVELS", "2"))
+        if self.prompt_refine_levels < 0:
+            raise ValueError("NNUNET_SAM2_PROMPT_REFINE_LEVELS must be >= 0.")
+        self.prompt_refine_levels = min(self.prompt_refine_levels, len(self.encoder.output_channels))
+        self.prompt_proj = nn.ModuleList(
+            [conv_cls(1, x_ch, kernel_size=1, bias=False) for x_ch in self.encoder.output_channels]
+        )
+        self.prompt_gate = nn.ModuleList(
+            [conv_cls(2 * x_ch, x_ch, kernel_size=1, bias=True) for x_ch in self.encoder.output_channels]
+        )
+        self.prompt_scale = nn.ParameterList(
+            [nn.Parameter(torch.tensor(0.0)) for _ in self.encoder.output_channels]
+        )
+        corr_hidden_dim = int(os.environ.get("NNUNET_SAM2_CORR_MASK_HIDDEN_DIM", "64"))
+        if corr_hidden_dim <= 0:
+            raise ValueError("NNUNET_SAM2_CORR_MASK_HIDDEN_DIM must be > 0.")
+        self.correction_mask_encoder = CorrectionMaskEncoder(
+            prompt_embed_dim=int(self.sam_prompt_encoder.embed_dim),
+            hidden_dim=corr_hidden_dim,
+        )
+        self._print_trainable_summary()
+
+    @staticmethod
+    def _count_parameters(module: nn.Module) -> Tuple[int, int]:
+        total = sum(p.numel() for p in module.parameters())
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        return trainable, total
+
+    def _print_trainable_summary(self) -> None:
+        groups = {
+            "nnUNet encoder": self.encoder,
+            "nnUNet decoder": self.decoder,
+            "SAM2 image encoder incl Adapter": self.sam_image_encoder,
+            "SAM2 prompt encoder": self.sam_prompt_encoder,
+            "SAM2 mask decoder": self.sam_mask_decoder,
+            "CorrectionMaskEncoder": self.correction_mask_encoder,
+            "SAM image fusion": nn.ModuleList([self.sam_unify, self.fuse_proj, self.fuse_gate or nn.ModuleList()]),
+            "prompt logit fusion": nn.ModuleList([self.prompt_proj, self.prompt_gate]),
+        }
+        print("v3-1 SAM2 refinement requires_grad summary:")
+        for name, module in groups.items():
+            trainable, total = self._count_parameters(module)
+            print(f"  {name}: trainable={trainable} / total={total}")
+        adapter_trainable = sum(
+            p.numel()
+            for name, p in self.sam_image_encoder.named_parameters()
+            if "prompt_learn" in name and p.requires_grad
+        )
+        trunk_trainable = sum(
+            p.numel()
+            for name, p in self.sam_image_encoder.named_parameters()
+            if "prompt_learn" not in name and p.requires_grad
+        )
+        print(f"  Adapter trainable params: {adapter_trainable}")
+        print(f"  SAM2 original image encoder trainable params: {trunk_trainable}")
 
     @staticmethod
     def _normalize_sam_outputs(sam_outputs) -> List[torch.Tensor]:
@@ -330,39 +421,172 @@ class SAM2DualEncoderResidualUNet(nn.Module):
             feats = self._normalize_sam_outputs(self.sam_encoder(dummy))
         return [int(i.shape[1]) for i in feats]
 
-    def _sam_encode_in_chunks(self, x_2d: torch.Tensor) -> List[torch.Tensor]:
+    @staticmethod
+    def _slice_volume(x: torch.Tensor) -> torch.Tensor:
+        b, c, d, h, w = x.shape
+        return x.permute(0, 2, 1, 3, 4).reshape(b * d, c, h, w)
+
+    def _build_mask_prompt(self, init_mask_2d: torch.Tensor) -> torch.Tensor:
+        mask_prompt = F.interpolate(
+            init_mask_2d.float(),
+            size=self.sam_prompt_encoder.mask_input_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        return mask_prompt
+
+    def _decode_prompt_logits(
+        self,
+        trunk_feats: List[torch.Tensor],
+        initial_mask_prompt: Union[torch.Tensor, None],
+        corr_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        image_features, _ = self.sam_image_encoder.neck(trunk_feats)
+        image_features_for_sam = image_features[-3:] if len(image_features) >= 3 else image_features
+        image_embedding = image_features_for_sam[-1]
+        high_res_features = None
+        if self.use_high_res_features_in_sam and len(image_features_for_sam) >= 3:
+            high_res_features = [
+                self.sam_mask_decoder.conv_s0(image_features_for_sam[0]),
+                self.sam_mask_decoder.conv_s1(image_features_for_sam[1]),
+            ]
+        empty_coords = torch.zeros((image_embedding.shape[0], 1, 2), device=image_embedding.device)
+        empty_labels = -torch.ones((image_embedding.shape[0], 1), device=image_embedding.device, dtype=torch.int64)
+        sparse_embeddings, dense_embeddings = self.sam_prompt_encoder(
+            points=(empty_coords, empty_labels),
+            boxes=None,
+            masks=initial_mask_prompt,
+        )
+        if dense_embeddings.shape[2:] != image_embedding.shape[2:]:
+            dense_embeddings = F.interpolate(
+                dense_embeddings,
+                size=image_embedding.shape[2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        dense_init_embeddings = dense_embeddings
+        dense_corr_embeddings = self.correction_mask_encoder(corr_masks, target_hw=dense_init_embeddings.shape[2:])
+        assert dense_corr_embeddings.shape[0] == image_embedding.shape[0], (
+            f"dense correction batch {dense_corr_embeddings.shape[0]} != image batch {image_embedding.shape[0]}"
+        )
+        assert dense_corr_embeddings.shape == dense_init_embeddings.shape, (
+            f"dense correction shape {dense_corr_embeddings.shape} != dense init shape {dense_init_embeddings.shape}"
+        )
+        dense_embeddings = dense_init_embeddings + dense_corr_embeddings
+        image_pe = self.sam_prompt_encoder.get_dense_pe().to(image_embedding.device, dtype=image_embedding.dtype)
+        if image_pe.shape[2:] != image_embedding.shape[2:]:
+            image_pe = F.interpolate(image_pe, size=image_embedding.shape[2:], mode="bilinear", align_corners=False)
+        assert sparse_embeddings.shape[0] == image_embedding.shape[0], (
+            f"sparse prompt batch {sparse_embeddings.shape[0]} != image batch {image_embedding.shape[0]}"
+        )
+        assert dense_embeddings.shape[0] == image_embedding.shape[0], (
+            f"dense prompt batch {dense_embeddings.shape[0]} != image batch {image_embedding.shape[0]}"
+        )
+        low_res_masks, _, _, _ = self.sam_mask_decoder(
+            image_embeddings=image_embedding,
+            image_pe=image_pe,
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=False,
+            repeat_image=False,
+            high_res_features=high_res_features,
+        )
+        assert low_res_masks.shape[0] == image_embedding.shape[0], "SAM prompt logits batch mismatch."
+        return low_res_masks[:, 0:1]
+
+    def _sam_encode_in_chunks(
+        self,
+        x_2d: torch.Tensor,
+        init_mask_2d: torch.Tensor,
+        pos_corr_2d: Union[torch.Tensor, None] = None,
+        neg_corr_2d: Union[torch.Tensor, None] = None,
+        source_hw: Tuple[int, int] = None,
+    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
         feats = None
+        prompt_logits = []
         bs = x_2d.shape[0]
+        assert init_mask_2d.shape[0] == bs, "Initial mask prompt batch must match SAM image batch."
+        mask_prompt_all = self._build_mask_prompt(init_mask_2d) if self.use_initial_mask_as_sam_prompt else None
+        if mask_prompt_all is not None:
+            assert mask_prompt_all.shape[0] == bs, "Initial mask prompt batch must match SAM image batch."
+        if pos_corr_2d is None:
+            pos_corr_2d = init_mask_2d.new_zeros(init_mask_2d.shape)
+        if neg_corr_2d is None:
+            neg_corr_2d = init_mask_2d.new_zeros(init_mask_2d.shape)
+        corr_masks_all = torch.cat((pos_corr_2d.float(), neg_corr_2d.float()), dim=1)
+        assert corr_masks_all.shape[0] == bs and corr_masks_all.shape[1] == 2, (
+            f"Correction masks must be [B*D,2,H,W], got {tuple(corr_masks_all.shape)}."
+        )
         for i in range(0, bs, self.slice_batch):
             part = x_2d[i: i + self.slice_batch]
             part_feats = self._normalize_sam_outputs(self.sam_encoder(part))
+            mask_prompt = None if mask_prompt_all is None else mask_prompt_all[i: i + self.slice_batch]
+            corr_masks = corr_masks_all[i: i + self.slice_batch]
+            assert part.shape[0] == corr_masks.shape[0], "SAM image and correction mask chunk batch mismatch."
+            if mask_prompt is not None:
+                assert part.shape[0] == mask_prompt.shape[0], "SAM image and initial mask prompt chunk batch mismatch."
+            prompt_logits.append(self._decode_prompt_logits(part_feats, mask_prompt, corr_masks))
             if feats is None:
                 feats = [[] for _ in range(len(part_feats))]
             if len(part_feats) != len(feats):
                 raise RuntimeError("Inconsistent number of SAM2 feature levels across chunks.")
             for j, f in enumerate(part_feats):
                 feats[j].append(f)
-        return [torch.cat(i, dim=0) for i in feats]
+        return [torch.cat(i, dim=0) for i in feats], torch.cat(prompt_logits, dim=0)
 
-    def _build_sam_feats_2d(self, x: torch.Tensor) -> List[torch.Tensor]:
-        sam_x = self.sam_input_adapter(x)
+    def _build_sam_feats_2d(
+        self,
+        ct: torch.Tensor,
+        init_mask: torch.Tensor,
+        pos_corr: Union[torch.Tensor, None] = None,
+        neg_corr: Union[torch.Tensor, None] = None,
+    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        source_hw = (int(ct.shape[-2]), int(ct.shape[-1]))
+        sam_x = self.sam_input_adapter(ct)
         sam_x = F.interpolate(
             sam_x,
             size=(self.sam_input_size, self.sam_input_size),
             mode="bilinear",
             align_corners=True,
         )
-        return self._sam_encode_in_chunks(sam_x)
+        assert sam_x.shape[0] == init_mask.shape[0], "SAM image batch must match initial mask batch."
+        assert sam_x.shape[1] == 3 and sam_x.shape[2] == self.sam_input_size and sam_x.shape[3] == self.sam_input_size
+        return self._sam_encode_in_chunks(
+            sam_x,
+            init_mask,
+            pos_corr_2d=pos_corr,
+            neg_corr_2d=neg_corr,
+            source_hw=source_hw,
+        )
 
-    def _build_sam_feats_3d(self, x: torch.Tensor) -> List[torch.Tensor]:
-        b, c, d, h, w = x.shape
-        slices = x.permute(0, 2, 1, 3, 4).reshape(b * d, c, h, w)
-        sam_feats_2d = self._build_sam_feats_2d(slices)
+    def _build_sam_feats_3d(
+        self,
+        ct: torch.Tensor,
+        init_mask: torch.Tensor,
+        pos_corr: Union[torch.Tensor, None] = None,
+        neg_corr: Union[torch.Tensor, None] = None,
+    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        b, _, d, h, w = ct.shape
+        slices = self._slice_volume(ct)
+        init_slices = self._slice_volume(init_mask)
+        pos_corr_slices = None if pos_corr is None else self._slice_volume(pos_corr)
+        neg_corr_slices = None if neg_corr is None else self._slice_volume(neg_corr)
+        sam_feats_2d, prompt_logits_2d = self._build_sam_feats_2d(
+            slices,
+            init_slices,
+            pos_corr_slices,
+            neg_corr_slices,
+        )
         sam_feats_3d = []
         for feat_2d in sam_feats_2d:
             c_out = feat_2d.shape[1]
             sam_feats_3d.append(feat_2d.reshape(b, d, c_out, feat_2d.shape[-2], feat_2d.shape[-1]).permute(0, 2, 1, 3, 4))
-        return sam_feats_3d
+        prompt_logits_2d = F.interpolate(prompt_logits_2d, size=(h, w), mode="bilinear", align_corners=False)
+        prompt_logits_3d = prompt_logits_2d.reshape(b, d, 1, h, w).permute(0, 2, 1, 3, 4)
+        assert prompt_logits_3d.shape == init_mask.shape, (
+            f"SAM prompt logits shape {prompt_logits_3d.shape} != initial mask shape {init_mask.shape}"
+        )
+        return sam_feats_3d, prompt_logits_3d
 
     @staticmethod
     def _nearest_scale_idx(skip_spatial, sam_spatials) -> int:
@@ -387,9 +611,48 @@ class SAM2DualEncoderResidualUNet(nn.Module):
         mode = "bilinear" if self.net_dim == 2 else "trilinear"
         return F.interpolate(feat, size=skip.shape[2:], mode=mode, align_corners=False)
 
+    def _fuse_prompt_logits(self, skips: List[torch.Tensor], prompt_logits: torch.Tensor) -> List[torch.Tensor]:
+        if self.prompt_refine_levels == 0:
+            return skips
+        fused = list(skips)
+        start_idx = max(0, len(skips) - self.prompt_refine_levels)
+        for i in range(start_idx, len(skips)):
+            prompt_feat = prompt_logits
+            if prompt_feat.shape[2:] != fused[i].shape[2:]:
+                mode = "bilinear" if self.net_dim == 2 else "trilinear"
+                prompt_feat = F.interpolate(prompt_feat, size=fused[i].shape[2:], mode=mode, align_corners=False)
+            prompt_proj = self.prompt_proj[i](prompt_feat)
+            assert prompt_proj.shape == fused[i].shape, "Prompt fusion projection shape mismatch."
+            gate = torch.sigmoid(self.prompt_gate[i](torch.cat((fused[i], prompt_proj), dim=1)))
+            fused[i] = fused[i] + self.prompt_scale[i] * gate * prompt_proj
+        return fused
+
     def forward(self, x: torch.Tensor):
-        skips = list(self.encoder(x))
-        sam_feats = self._build_sam_feats_2d(x) if self.net_dim == 2 else self._build_sam_feats_3d(x)
+        assert x.ndim in (4, 5), f"Expected 2D/3D input, got shape {tuple(x.shape)}."
+        assert x.shape[1] >= 2, f"v3-1 expects at least 2 channels: CT + initial mask, got {x.shape[1]}."
+        ct = x[:, 0:1]
+        init_mask = x[:, 1:2]
+        # Channel convention:
+        # 0 CT, 1 initial CTV mask, 2 positive correction mask (FN),
+        # 3 negative correction mask (FP). Point/box prompts are not used in this version.
+        pos_corr = x[:, 2:3] if x.shape[1] > 2 else torch.zeros_like(init_mask)
+        neg_corr = x[:, 3:4] if x.shape[1] > 3 else torch.zeros_like(init_mask)
+        assert pos_corr.shape == init_mask.shape, "Positive correction mask shape must match initial mask."
+        assert neg_corr.shape == init_mask.shape, "Negative correction mask shape must match initial mask."
+        if self.net_dim == 3:
+            assert ct.ndim == 5 and init_mask.ndim == 5, "3D mode expects [B,C,D,H,W]."
+        else:
+            assert ct.ndim == 4 and init_mask.ndim == 4, "2D mode expects [B,C,H,W]."
+
+        main_x = torch.cat((ct, init_mask), dim=1)
+        if self.main_input_channels > 2:
+            pad_channels = self.main_input_channels - 2
+            main_x = torch.cat((main_x, main_x.new_zeros((main_x.shape[0], pad_channels, *main_x.shape[2:]))), dim=1)
+        skips = list(self.encoder(main_x))
+        if self.net_dim == 2:
+            sam_feats, prompt_logits = self._build_sam_feats_2d(ct, init_mask, pos_corr, neg_corr)
+        else:
+            sam_feats, prompt_logits = self._build_sam_feats_3d(ct, init_mask, pos_corr, neg_corr)
         sam_spatials = [i.shape[2:] for i in sam_feats]
 
         fused_skips = []
@@ -404,6 +667,15 @@ class SAM2DualEncoderResidualUNet(nn.Module):
             else:
                 fused_skips.append(skip + self.fuse_scale[i] * sam_proj)
 
+        fused_skips = self._fuse_prompt_logits(fused_skips, prompt_logits)
+        if self.debug_shapes:
+            print(
+                "v3-1 shapes:",
+                f"ct={tuple(ct.shape)}",
+                f"init_mask={tuple(init_mask.shape)}",
+                f"prompt_logits={tuple(prompt_logits.shape)}",
+                f"skips={[tuple(i.shape) for i in fused_skips]}",
+            )
         return self.decoder(fused_skips)
 
     def compute_conv_feature_map_size(self, input_size):
