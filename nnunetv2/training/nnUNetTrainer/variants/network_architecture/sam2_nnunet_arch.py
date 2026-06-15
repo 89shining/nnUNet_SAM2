@@ -580,9 +580,17 @@ class SAM2DualEncoderResidualUNet(nn.Module):
         sam_feats_3d = []
         for feat_2d in sam_feats_2d:
             c_out = feat_2d.shape[1]
-            sam_feats_3d.append(feat_2d.reshape(b, d, c_out, feat_2d.shape[-2], feat_2d.shape[-1]).permute(0, 2, 1, 3, 4))
+            sam_feats_3d.append(
+                feat_2d.reshape(b, d, c_out, feat_2d.shape[-2], feat_2d.shape[-1])
+                .permute(0, 2, 1, 3, 4)
+                .contiguous()
+            )
         prompt_logits_2d = F.interpolate(prompt_logits_2d, size=(h, w), mode="bilinear", align_corners=False)
-        prompt_logits_3d = prompt_logits_2d.reshape(b, d, 1, h, w).permute(0, 2, 1, 3, 4)
+        prompt_logits_3d = (
+            prompt_logits_2d.reshape(b, d, 1, h, w)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
         assert prompt_logits_3d.shape == init_mask.shape, (
             f"SAM prompt logits shape {prompt_logits_3d.shape} != initial mask shape {init_mask.shape}"
         )
