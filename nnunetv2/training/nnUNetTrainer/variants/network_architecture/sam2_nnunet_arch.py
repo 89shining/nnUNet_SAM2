@@ -50,21 +50,27 @@ _add_sam2_unet_repo_to_path()
 from sam2.build_sam import build_sam2  # noqa: E402
 
 
-class Adapter(nn.Module):
-    def __init__(self, blk: nn.Module) -> None:
+class LoRALinear(nn.Module):
+    def __init__(self, base_layer: nn.Linear, rank: int = 4, alpha: float = 16.0, dropout: float = 0.1) -> None:
         super().__init__()
-        self.block = blk
-        dim = blk.attn.qkv.in_features
-        self.prompt_learn = nn.Sequential(
-            nn.Linear(dim, 32),
-            nn.GELU(),
-            nn.Linear(32, dim),
-            nn.GELU(),
-        )
+        if rank <= 0:
+            raise ValueError(f"LoRA rank must be > 0, got {rank}")
+        self.base_layer = base_layer
+        self.base_layer.requires_grad_(False)
+        self.lora_down = nn.Linear(base_layer.in_features, rank, bias=False)
+        self.lora_up = nn.Linear(rank, base_layer.out_features, bias=False)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.scaling = alpha / rank
+        nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_up.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        prompt = self.prompt_learn(x)
-        return self.block(x + prompt)
+        return self.base_layer(x) + self.lora_up(self.lora_down(self.dropout(x))) * self.scaling
+
+
+def _inject_lora_into_sam_encoder(sam_encoder: nn.Module, rank: int, alpha: float, dropout: float) -> None:
+    for blk in sam_encoder.blocks:
+        blk.attn.qkv = LoRALinear(blk.attn.qkv, rank=rank, alpha=alpha, dropout=dropout)
 
 
 class SAM2FusionDecoder(nn.Module):
@@ -269,7 +275,16 @@ class SAM2DualEncoderResidualUNet(nn.Module):
         self.sam_encoder = sam_model.image_encoder.trunk
         for p in self.sam_encoder.parameters():
             p.requires_grad = False
-        self.sam_encoder.blocks = nn.Sequential(*[Adapter(b) for b in self.sam_encoder.blocks])
+
+        self.lora_rank = int(os.environ.get("NNUNET_SAM2_LORA_RANK", "4"))
+        self.lora_alpha = float(os.environ.get("NNUNET_SAM2_LORA_ALPHA", "16"))
+        self.lora_dropout = float(os.environ.get("NNUNET_SAM2_LORA_DROPOUT", "0.1"))
+        _inject_lora_into_sam_encoder(
+            self.sam_encoder,
+            rank=self.lora_rank,
+            alpha=self.lora_alpha,
+            dropout=self.lora_dropout,
+        )
 
         self.sam_input_size = int(os.environ.get("NNUNET_SAM2_INPUT_SIZE", "1024"))
         if self.sam_input_size <= 0:
