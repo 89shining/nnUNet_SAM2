@@ -50,23 +50,6 @@ _add_sam2_unet_repo_to_path()
 from sam2.build_sam import build_sam2  # noqa: E402
 
 
-class Adapter(nn.Module):
-    def __init__(self, blk: nn.Module) -> None:
-        super().__init__()
-        self.block = blk
-        dim = blk.attn.qkv.in_features
-        self.prompt_learn = nn.Sequential(
-            nn.Linear(dim, 32),
-            nn.GELU(),
-            nn.Linear(32, dim),
-            nn.GELU(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        prompt = self.prompt_learn(x)
-        return self.block(x + prompt)
-
-
 class SAM2FusionDecoder(nn.Module):
     """
     Default nnUNet-style decoder that expects unchanged skip channel sizes.
@@ -269,7 +252,6 @@ class SAM2DualEncoderResidualUNet(nn.Module):
         self.sam_encoder = sam_model.image_encoder.trunk
         for p in self.sam_encoder.parameters():
             p.requires_grad = False
-        self.sam_encoder.blocks = nn.Sequential(*[Adapter(b) for b in self.sam_encoder.blocks])
 
         self.sam_input_size = int(os.environ.get("NNUNET_SAM2_INPUT_SIZE", "1024"))
         if self.sam_input_size <= 0:
